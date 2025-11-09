@@ -1,81 +1,81 @@
-
-# mp4_to_gif_auto.ps1
-# Batch convert all MP4 files in a folder to GIFs using FFmpeg.
-# Processes up to 20 files in parallel, 33fps, 540px width, 5s max length.
+<#  
+    mp4_to_gif_auto.ps1
+    -------------------------------------------
+    Converts all videos in the current folder into GIFs.
+    • FPS: 33
+    • Size: 540xAuto (keeps aspect ratio)
+    • Duration: first 5 seconds
+    • Batch size: 20 (runs 20 conversions in parallel)
+    • Output folder: ./gifs (auto-created)
+#>
 
 param(
-    [string]$InputFolder = ".",
-    [string]$OutputFolder = ".\gifs",
-    [int]$BatchSize = 20
+    [int]$BatchSize   = 20,
+    [int]$Fps         = 33,
+    [int]$Width       = 540,
+    [int]$MaxSeconds  = 5,
+    [switch]$SkipIfExists
 )
 
-# --- Checks ---
-if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-    Write-Host "FFmpeg not found. Please install it and add it to PATH." -ForegroundColor Red
+# --- Check ffmpeg ---
+$ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
+if (-not $ffmpeg) {
+    Write-Error "ffmpeg not found in PATH. Install ffmpeg and ensure it's accessible from PowerShell."
     exit 1
 }
+$ffmpegPath = $ffmpeg.Source
 
-# Prepare output folder
-if (-not (Test-Path -LiteralPath $OutputFolder)) {
-    New-Item -ItemType Directory -Path $OutputFolder | Out-Null
-}
+# --- Gather video files in current folder ---
+$extensions = @('.mp4','.mov','.mkv','.avi','.m4v','.wmv','.webm','.mts','.m2ts','.3gp')
+$files = Get-ChildItem -File | Where-Object { $extensions -contains $_.Extension.ToLower() }
 
-# --- Settings ---
-$fps = 33
-$scale = 540
-$duration = 5  # seconds limit
-
-# Get all MP4 files (case-insensitive), files only
-$files = Get-ChildItem -LiteralPath $InputFolder -Filter "*.mp4" -File
-if ($files.Count -eq 0) {
-    Write-Host "No MP4 files found in '$InputFolder'." -ForegroundColor Yellow
+if (-not $files -or $files.Count -eq 0) {
+    Write-Host "No video files found in: $PWD"
     exit 0
 }
 
-Write-Host "Found $($files.Count) MP4 files. Processing in batches of $BatchSize..." -ForegroundColor Cyan
+# --- Prepare output directory ---
+$outDir = Join-Path $PWD 'gifs'
+if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
+
+# --- FFmpeg filter for smooth high-quality GIFs ---
+$filter = "[0:v]fps=$Fps,scale=${Width}:-2:flags=lanczos,split[s0][s1];[s0]palettegen=stats_mode=full[pal];[s1][pal]paletteuse=dither=sierra2_4a"
 
 # --- Process in batches ---
-for ($i = 0; $i -lt $files.Count; $i += $BatchSize) {
-    $batch = $files[$i..([Math]::Min($i + $BatchSize - 1, $files.Count - 1))]
-    $batchNum = [Math]::Floor($i / $BatchSize) + 1
-    Write-Host "Starting batch $batchNum ($($batch.Count) files)..." -ForegroundColor Yellow
+$total = $files.Count
+$index = 0
+while ($index -lt $total) {
+    $batch = $files[$index..([math]::Min($index + $BatchSize - 1, $total - 1))]
+    Write-Host "`nProcessing batch $([int]($index / $BatchSize) + 1) of $([math]::Ceiling($total / $BatchSize)) - $($batch.Count) file(s)..."
 
     $jobs = @()
-    foreach ($file in $batch) {
-        $input  = $file.FullName
-        $name   = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
-        $output = Join-Path $OutputFolder "$name.gif"
+    foreach ($f in $batch) {
+        $outPath = Join-Path $outDir ("{0}.gif" -f [System.IO.Path]::GetFileNameWithoutExtension($f.Name))
+        if ($SkipIfExists -and (Test-Path $outPath)) {
+            Write-Host "Skipping existing: $($f.Name)"
+            continue
+        }
 
-        $jobs += Start-Job -ScriptBlock {
-            param($input, $output, $fps, $scale, $duration)
-
-            $ErrorActionPreference = 'Stop'
-            $palette = Join-Path $env:TEMP ("palette_{0}.png" -f [guid]::NewGuid().ToString())
-            try {
-                # Palette generation
-                ffmpeg -y -t $duration -i "$input" -vf "fps=${fps},scale=${scale}:-1:flags=lanczos,palettegen" "$palette" 2>&1 | Out-Null
-                # GIF encode using palette
-                ffmpeg -y -t $duration -i "$input" -i "$palette" -filter_complex "fps=${fps},scale=${scale}:-1:flags=lanczos[x];[x][1:v]paletteuse" "$output" 2>&1 | Out-Null
-                Write-Output ("OK  : {0}" -f $output)
-            }
-            catch {
-                Write-Output ("FAIL: {0}`n{1}" -f $input, $_ | Out-String)
-            }
-            finally {
-                if (Test-Path -LiteralPath $palette) { Remove-Item -LiteralPath $palette -ErrorAction SilentlyContinue }
-            }
-        } -ArgumentList $input, $output, $fps, $scale, $duration
+        $jobs += Start-Job -Name $f.Name -ScriptBlock {
+            param($ffmpegPath, $inFile, $outFile, $filterGraph, $maxSec)
+            & $ffmpegPath -y -i $inFile -t $maxSec -filter_complex $filterGraph -an $outFile 2>&1 | Out-Null
+            return $LASTEXITCODE
+        } -ArgumentList $ffmpegPath, $f.FullName, $outPath, $filter, $MaxSeconds
     }
 
-    # Wait and collect results
-    $jobs | Wait-Job | Out-Null
-    $results = $jobs | Receive-Job
-    $jobs | Remove-Job | Out-Null
+    if ($jobs.Count -gt 0) {
+        Wait-Job -Job $jobs | Out-Null
+        foreach ($j in $jobs) {
+            if ($j.State -eq 'Completed') {
+                Write-Host "[OK] $($j.Name)"
+            } else {
+                Write-Warning "[FAIL] $($j.Name) -> $($j.State)"
+            }
+            Remove-Job $j
+        }
+    }
 
-    # Show per-file results for this batch
-    $results | ForEach-Object { Write-Host $_ }
-
-    Write-Host "Batch $batchNum completed." -ForegroundColor Green
+    $index += $BatchSize
 }
 
-Write-Host "All conversions completed. GIFs saved in: $OutputFolder" -ForegroundColor Cyan
+Write-Host "`n Conversion completed! GIFs saved in: $outDir"
